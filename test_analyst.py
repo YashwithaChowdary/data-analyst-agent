@@ -129,15 +129,36 @@ class LlmPlannerTests(unittest.TestCase):
         def fake(prompt):
             calls.append(prompt)
             return next(replies)
-        plan, problems = plan_with_llm("avg price per region", self.df, fake)
+        plan, problems, cannot = plan_with_llm("avg price per region", self.df, fake)
         self.assertEqual(problems, [])
         self.assertEqual(len(calls), 2)
         self.assertIn("unknown column 'colour'", calls[1])
+        self.assertIn("cannot_answer", calls[1])
 
     def test_unusable_reply_gives_clear_error_not_a_crash(self):
         report = answer("q", self.df, lambda p: "I cannot help with that")
         self.assertFalse(report.ok)
         self.assertIn("could not be used", report.errors[0])
+
+    def test_model_can_decline_instead_of_substituting_a_column(self):
+        report = answer("average price per colour", self.df,
+                        lambda p: '{"cannot_answer": "there is no colour column"}')
+        self.assertFalse(report.ok)
+        self.assertEqual(report.tables, [])
+        self.assertIn("cannot be answered", report.errors[0])
+        self.assertIn("no colour column", report.errors[0])
+
+    def test_decline_after_a_bad_first_plan(self):
+        replies = iter(['[{"tool": "group_summary", "args": {"by": "colour", "column": "price"}}]',
+                        '{"cannot_answer": "no colour column"}'])
+        report = answer("q", self.df, lambda p: next(replies))
+        self.assertIn("cannot be answered", report.errors[0])
+
+    def test_the_prompt_tells_the_model_not_to_substitute_columns(self):
+        seen = []
+        plan_with_llm("q", self.df, lambda p: seen.append(p) or '[{"tool": "describe"}]')
+        self.assertIn("Never substitute", seen[0])
+        self.assertIn("cannot_answer", seen[0])
 
 
 if __name__ == "__main__":

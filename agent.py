@@ -83,39 +83,65 @@ def _tool_text():
     return "\n".join(f"- {name}({', '.join(args)})" for name, (_, args) in TOOLS.items())
 
 
-def _parse_plan(text):
-    m = re.search(r"\[.*\]", text, re.S)
+def _parse_reply(text):
+    """Return a list of steps, or a dict like {"cannot_answer": "reason"}."""
+    m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
     if not m:
-        raise ValueError("no JSON list in reply")
-    return json.loads(m.group(0))
+        raise ValueError("no JSON in reply")
+    data = json.loads(m.group(0))
+    if isinstance(data, dict) and "cannot_answer" in data:
+        return data
+    if not isinstance(data, list):
+        raise ValueError("expected a JSON list of steps")
+    return data
+
+
+RULES = ("Use only these tools and only these column names. Never substitute a "
+         "different column for the one the question asks about. If the question "
+         'cannot be answered with these columns, reply {"cannot_answer": "short reason"} '
+         "instead of a plan.")
 
 
 def plan_with_llm(question, df, llm, repairs=1):
-    """Ask a model for a plan. Invalid plans are sent back once with the errors."""
+    """Ask a model for a plan.
+
+    Returns (plan, problems, cannot_answer). An invalid plan is sent back once
+    with the errors. If the model says the question cannot be answered, that
+    reason is returned and nothing is run.
+    """
     prompt = (f"Question: {question}\n\nColumns:\n{_schema_text(df)}\n\n"
               f"Tools:\n{_tool_text()}\n\n"
               "Reply with only a JSON list of steps, each like "
               '{"tool": "group_summary", "args": {"by": "region", "column": "units", "agg": "sum"}}. '
-              "Use only these tools and only these column names.")
+              + RULES)
     reply = llm(prompt)
+    plan, problems = [], []
     for attempt in range(repairs + 1):
         try:
-            plan = _parse_plan(reply)
-            problems = validate_plan(plan, list(df.columns))
+            parsed = _parse_reply(reply)
         except (ValueError, json.JSONDecodeError) as exc:
             plan, problems = [], [f"Could not read the reply as a JSON list: {exc}"]
-        if not problems:
-            return plan, []
+        else:
+            if isinstance(parsed, dict):
+                return [], [], str(parsed["cannot_answer"])
+            plan = parsed
+            problems = validate_plan(plan, list(df.columns))
+            if not problems:
+                return plan, [], ""
         if attempt < repairs:
             reply = llm(prompt + "\n\nYour last plan had these problems:\n- "
-                        + "\n- ".join(problems) + "\nReturn a corrected JSON list.")
-    return plan, problems
+                        + "\n- ".join(problems) + "\n" + RULES
+                        + " Return a corrected JSON list, or cannot_answer.")
+    return plan, problems, ""
 
 
 def answer(question, df, llm):
-    plan, problems = plan_with_llm(question, df, llm)
+    plan, problems, cannot = plan_with_llm(question, df, llm)
+    report = Report(question, plan)
+    if cannot:
+        report.errors = ["This question cannot be answered with this table: " + cannot]
+        return report
     if problems:
-        report = Report(question, plan)
         report.errors = ["The model's plan could not be used: " + "; ".join(problems)]
         return report
     return run_plan(question, plan, df)
